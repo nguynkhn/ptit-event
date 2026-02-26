@@ -1,7 +1,11 @@
-param([switch]$Login, $Port = 42069, $Timeout = 5,
-    $SessionFile = "session.dat", $EventFile = "events.inc",
-    $ExpireOffset = 30, $DateSpan = 7,
-    $Locale = "vi-VN", $DateFormat = "dddd, dd MMMM", $TimeFormat = "HH:mm")
+param(
+    $Action,
+    $Port = 42069, $TimeoutSec = 5, $ExpireOffsetSec = 30,
+    $SessionFile = "session.dat",
+    [DateTime]$From, [DateTime]$To, $DateSpanDay = 7, $DateStart = "Now",
+    $DateFormat = "dddd, dd MMMM", $TimeFormat = "HH:mm",
+    [System.Globalization.CultureInfo]$Culture = "vi-VN"
+)
 
 $ApiUrl = "https://gwdu.ptit.edu.vn"
 $AuthUrl = "${ApiUrl}/sso/realms/ptit/protocol/openid-connect/auth"
@@ -16,7 +20,7 @@ $EventSources = @{
     SlinkSuKien = "/slink/su-kien/user"
 }
 
-function Exchange-Token {
+function Exchange-Tokens {
     param ($Code, $RefreshToken)
 
     $body = if ($Code) {
@@ -35,12 +39,36 @@ function Exchange-Token {
         }
     }
 
-    $response = Invoke-RestMethod -Method Post -Uri $TokenUrl -Body $body -TimeoutSec $Timeout
+    $response = Invoke-RestMethod -Method Post -Uri $TokenUrl -Body $body -TimeoutSec $TimeoutSec
     return @{
-        accessToken = $response.access_token
-        refreshToken = $response.refresh_token
-        expireDate = (Get-Date).AddSeconds($response.expires_in).ToString("o")
+        AccessToken = $response.access_token
+        RefreshToken = $response.refresh_token
+        ExpireDate = (Get-Date).AddSeconds($response.expires_in).ToString("o")
     }
+}
+
+function Load-Tokens {
+    if (-not (Test-Path $SessionFile -PathType Leaf)) {
+        return $null
+    }
+
+    $encrypted = Get-Content $SessionFile
+    $secured = $encrypted | ConvertTo-SecureString
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secured)
+    try {
+        $json = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+    }
+
+    $tokens = $json | ConvertFrom-Json
+    $expireDate = [DateTimeOffset]::Parse($tokens.ExpireDate)
+    if ($expireDate -lt (Get-Date).AddSeconds($ExpireOffsetSec)) {
+        $tokens = Exchange-Tokens -RefreshToken $tokens.RefreshToken
+        Store-Tokens -Tokens $tokens
+    }
+
+    return $tokens
 }
 
 function Store-Tokens {
@@ -53,8 +81,8 @@ function Store-Tokens {
     $encrypted | Set-Content $SessionFile
 }
 
-if ($Login) {
-    $authRequest = "${authUrl}?response_type=code&client_id=${ClientId}&scope=${Scope}&redirect_uri=${RedirectUri}"
+function Start-LoginFlow {
+    $authRequest = "${AuthUrl}?response_type=code&client_id=${ClientId}&scope=${Scope}&redirect_uri=${RedirectUri}"
     Start-Process $authRequest
 
     $listener = [System.Net.HttpListener]::new()
@@ -70,126 +98,104 @@ if ($Login) {
     $context.Response.Close()
     $listener.Stop()
 
-    $tokens = Exchange-Token -Code $code
-    Store-Tokens -Tokens $tokens
-} else {
-    if (-not (Test-Path $SessionFile -PathType Leaf)) {
-        return $false
-    }
-
-    $encrypted = Get-Content $SessionFile
-    $secured = $encrypted | ConvertTo-SecureString
-    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secured)
-    try {
-        $json = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr)
-    } finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
-    }
-
-    $tokens = $json | ConvertFrom-Json
-    $expireDate = [DateTimeOffset]::Parse($tokens.expireDate)
-    if ($expireDate -lt (Get-Date).AddSeconds($ExpireOffset)) {
-        $tokens = Exchange-Token -RefreshToken $tokens.refreshToken
-        Store-Tokens -Tokens $tokens
-    }
+    return $code
 }
 
-$now = Get-Date
-$from = $now.ToString("o")
-$to = $now.AddDays($DateSpan).ToString("o")
+function Parse-Event {
+    param($Source, $Data)
 
-$events = @()
-$headers = @{
-    Authorization = "Bearer $($tokens.accessToken)"
-    Accept = "application/json"
+    $startDate = if ($Data.thoiGianGiao) { $Data.thoiGianGiao } else { $Data.thoiGianBatDau }
+    $event = @{
+        Title = $Source
+        Type = ""
+        Location = ""
+        StartDate = [DateTimeOffset]::parse($startDate).ToLocalTime()
+        EndDate = [DateTimeOffset]::parse($data.thoiGianKetThuc).ToLocalTime()
+    }
+
+     switch ($Source) {
+        "QldtThoiKhoaBieu" {
+            $event.Title = if ($Data.lopHocPhan.hocPhan.ten) {
+                $Data.lopHocPhan.hocPhan.ten
+            } elseif ($Data.lopHocPhan.maHocPhan) {
+                $Data.lopHocPhan.maHocPhan
+            } else {
+                $Data.tenLopHocPhan
+            }
+            $event.Type = 1
+            $event.Location = $Data.phongHoc
+        }
+        "QldtAssignment" {
+            $event.Title = $Data.noiDung
+            $event.Type = 3
+            $event.location = $Data.tenLopHocPhan
+        }
+        "KhaoThiLichThi" {
+            $event.Title = $Data.danhSachHocPhan.ten -join ", "
+            $event.Type = 2
+            $event.Location = $Data.phong.ma
+        }
+        "SlinkSuKien" {
+            $event.Title = $Data.tenSuKien
+            $event.Type = switch ($Data.loaiSuKien) {
+                "Chung" { 0 }
+                "Họp lớp" { 4 }
+                "Cá nhân" { 5 }
+                "Khác" { 6 }
+            }
+            $event.Location = $Data.diaDiem
+        }
+    }
+
+    return $event
 }
-foreach ($source in $EventSources.Keys) {
-    $path = $EventSources[$source]
-    $endpoint = "${ApiUrl}${path}/from/${from}/to/${to}"
 
-    try {
-        $response = Invoke-RestMethod -Uri $endpoint -Headers $headers -TimeoutSec $Timeout
-        if (-not $response.success) {
+function Fetch-Events {
+    param($AccessToken)
+
+    $events = @()
+    $headers = @{
+        Authorization = "Bearer ${AccessToken}"
+        Accept = "application/json"
+    }
+    foreach ($source in $EventSources.Keys) {
+        $path = $EventSources[$source]
+        $endpoint = "${ApiUrl}${path}/from/{0:o}/to/{1:o}" -f $From, $To
+
+        try {
+            $response = Invoke-RestMethod -Uri $endpoint -Headers $headers -TimeoutSec $TimeoutSec
+            if (-not $response.success) {
+                continue
+            }
+
+            foreach ($data in $response.data) {
+                $event = Parse-Event -Source $source -Data $data
+                $events += $event
+            }
+        } catch {
             continue
         }
-
-        foreach ($data in $response.data) {
-            $startDate =
-            $event = @{
-                title = $Source
-                type = ""
-                location = ""
-                startDate = if ($data.thoiGianGiao) { $data.thoiGianGiao } else { $data.thoiGianBatDau }
-                endDate = $data.thoiGianKetThuc
-            }
-
-            switch ($source) {
-                "QldtThoiKhoaBieu" {
-                    $event.title = if ($data.lopHocPhan.hocPhan.ten) {
-                        $data.lopHocPhan.hocPhan.ten
-                    } elseif ($data.lopHocPhan.maHocPhan) {
-                        $data.lopHocPhan.maHocPhan
-                    } else {
-                        $data.tenLopHocPhan
-                    }
-                    $event.type = 1
-                    $event.location = $data.phongHoc
-                }
-                "QldtAssignment" {
-                    $event.title = $data.noiDung
-                    $event.type = 3
-                    $event.location = $data.tenLopHocPhan
-                }
-                "KhaoThiLichThi" {
-                    $event.title = $data.danhSachHocPhan.ten -join ", "
-                    $event.type = 2
-                    $event.location = $data.phong.ma
-                }
-                "SlinkSuKien" {
-                    $event.title = $data.tenSuKien
-                    $event.type = switch ($data.loaiSuKien) {
-                        "Chung" { 0 }
-                        "Họp lớp" { 4 }
-                        "Cá nhân" { 5 }
-                        "Khác" { 6 }
-                    }
-                    $event.location = $data.diaDiem
-                }
-            }
-
-            $events += $event
-        }
-    } catch {
-        continue
     }
+
+    $sortedEvents = $events | Sort-Object { $_.StartDate }, { $_.EndDate }
+    return $sortedEvents | Group-Object { $_.StartDate.Date }
 }
 
-if (-not $events) {
+function Generate-Meters {
+    param($EventGroups)
+
+    $eventNo = 0
     $meters = @"
 [Variables]
 Generated=1
-
-[MeterNoEvent]
-Meter=String
-MeterStyle=StyleNoEvent
-"@
-} else {
-
-    $culture = [System.Globalization.CultureInfo]::GetCultureInfo($Locale)
-    $dates = $events | Sort-Object { $_.startDate }, { $_.endDate } | Group-Object { $_.startDate }
-
-    $meters = @"
-[Variables]
-Generated=1
-MeterFirst=MeterDate0
-MeterLast=MeterDate$($dates.Count - 1)
 `n
 "@
 
-    $eventNo = 0
-    for ($dateNo = 0; $dateNo -lt $dates.Count; ++$dateNo) {
-        $date = $dates[$dateNo]
-        $dateText = [DateTimeOffset]::parse($date.Name).ToLocalTime().ToString($DateFormat, $culture).Normalize([System.Text.NormalizationForm]::FormC)
+    for ($dateNo = 0; $dateNo -lt $EventGroups.Count; ++$dateNo) {
+        $group = $EventGroups[$dateNo]
+
+        $date = [DateTimeOffset]::parse($group.Name)
+        $dateText = $date.ToString($DateFormat, $Culture).Normalize([System.Text.NormalizationForm]::FormC)
         $meters += @"
 [MeterDate${dateNo}]
 Meter=String
@@ -198,9 +204,9 @@ Text=${dateText}
 `n
 "@
 
-    foreach ($event in $date.Group) {
-        $timeText = [DateTimeOffset]::parse($event.startDate).ToLocalTime().ToString($TimeFormat) + " - " + [DateTimeOffset]::parse($event.endDate).ToLocalTime().ToString($TimeFormat)
-        $meters += @"
+        foreach ($event in $group.Group) {
+            $timeText = "{0:${TimeFormat}} - {1:${TimeFormat}}" -f $event.StartDate, $event.EndDate
+$meters += @"
 [MeterCard${eventNo}]
 Meter=Shape
 MeterStyle=StyleCard
@@ -228,6 +234,52 @@ Text=$($event.location)
             ++$eventNo
         }
     }
+
+    return $meters
 }
 
-$meters | Out-File -FilePath $EventFile
+[Console]::OutputEncoding = [System.Text.Encoding]::Unicode
+switch ($Action.ToLower()) {
+    "Status" { return (Load-Tokens) -ne $null }
+    "Login" {
+        try {
+            $code = Start-LoginFlow
+            $tokens = Exchange-Tokens -Code $code
+            Store-Tokens -Tokens $tokens
+            return $true
+        } catch {
+            return $false
+        }
+    }
+    "Generate" {
+        $tokens = Load-Tokens
+
+        if (-not $From -and -not $To) {
+            $From = Get-Date
+            switch ($DateStart.ToLower()) {
+                "Now" {}
+                "Today" { $From = $From.Date }
+                "WeekStart" {
+                    $firstDayOfWeek = $Culture.DateTimeFormat.FirstDayOfWeek
+                    $diff = ($From.DayOfWeek - $firstDayOfWeek + 7) % 7
+                    $From = $From.Date.AddDays(-$diff)
+                }
+                default {
+                    $dateStartOffset = $DateStart -as [int]
+                    if ($dateStartOffset -eq $null) {
+                        Write-Error "Invalid DateStart"
+                    }
+
+                    $From = $From.Date.AddDays(-$dateStartOffset)
+                }
+            }
+            $To = $From.AddDays($DateSpanDay)
+        } elseif (-not $From -or-not $To) {
+            Write-Error "Missing From or To"
+        }
+
+        $eventGroups = Fetch-Events -AccessToken $tokens.AccessToken
+        return Generate-Meters -EventGroups $eventGroups
+    }
+    default { Write-Error "Invalid Action" }
+}
