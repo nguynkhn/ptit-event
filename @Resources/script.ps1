@@ -137,7 +137,10 @@ function Parse-Event {
         }
         "SlinkSuKien" {
             $event.Title = $Data.tenSuKien
-            $event.Type = switch ($Data.loaiSuKien) {
+            $eventType = [System.Text.Encoding]::GetEncoding(1252).GetString(
+                [System.Text.Encoding]::UTF8.GetBytes($Data.loaiSuKien)
+            )
+            $event.Type = switch ($eventType) {
                 "Chung" { 0 }
                 "Họp lớp" { 4 }
                 "Cá nhân" { 5 }
@@ -185,14 +188,14 @@ function Generate-Meters {
     param($EventGroups)
 
     $eventNo = 0
-    $meters = @"
-[Variables]
-Generated=1
-`n
-"@
+    $meters = "# Generated at $(Get-Date)`n"
 
     for ($dateNo = 0; $dateNo -lt $EventGroups.Count; ++$dateNo) {
         $group = $EventGroups[$dateNo]
+
+        if ($group.Group.Count -eq 0) {
+            continue
+        }
 
         $date = [DateTimeOffset]::parse($group.Name)
         $dateText = $date.ToString($DateFormat, $Culture).Normalize([System.Text.NormalizationForm]::FormC)
@@ -235,11 +238,18 @@ Text=$($event.location)
         }
     }
 
+    $meters += @"
+[Variables]
+Generated=1
+LastMeter=MeterCard$($eventNo - 1)
+`n
+"@
+
     return $meters
 }
 
 [Console]::OutputEncoding = [System.Text.Encoding]::Unicode
-switch ($Action.ToLower()) {
+switch ($Action) {
     "Status" { return (Load-Tokens) -ne $null }
     "Login" {
         try {
@@ -254,8 +264,13 @@ switch ($Action.ToLower()) {
     "Generate" {
         $tokens = Load-Tokens
 
+        if ($DateSpanDay -lt 0) {
+            Write-Error "Invalid DateSpanDay"
+        }
+
         if (-not $From -and -not $To) {
             $From = Get-Date
+
             switch ($DateStart.ToLower()) {
                 "Now" {}
                 "Today" { $From = $From.Date }
@@ -266,7 +281,7 @@ switch ($Action.ToLower()) {
                 }
                 default {
                     $dateStartOffset = $DateStart -as [int]
-                    if ($dateStartOffset -eq $null) {
+                    if ($dateStartOffset -eq $null -or ($dateStartOffset + $DateSpanDay) -eq 0) {
                         Write-Error "Invalid DateStart"
                     }
 
